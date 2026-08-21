@@ -1,10 +1,10 @@
 # audit-loop
 
 This is the **template** for running your own audit-loop hub: fork it, create
-your own GitHub App and credentials, then follow the setup sections below. A
-complete step-by-step adoption guide is tracked in this repo's issues. This
-template is extracted from a private reference instance that runs the loop in
-production.
+your own GitHub App and credentials, then follow the setup sections below.
+**Start with the complete step-by-step adoption guide: [`docs/adopt.md`](docs/adopt.md).**
+This template is extracted from a private reference instance that runs the
+loop in production.
 
 A centralized Claude Code plugin **and operations hub** for the
 architecture-audit loop: one source of truth for the `arch-auditor` agent,
