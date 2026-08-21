@@ -1,0 +1,123 @@
+# Auto-close an audit issue the moment its last approved finding merges
+# (part of the audit-loop plugin: see the /audit and /audit-fix commands).
+#
+# Without this, a fully-resolved audit issue sat open until the next
+# scheduled /audit run noticed and commented. Closing here is safe bookkeeping, not a
+# bypassed judgment: by the time this fires, BOTH human gates already passed
+# for every finding — the owner checked the box (approval) and merged the PR
+# (review). Any unchecked (undecided) finding blocks the close, and the
+# next /audit run's reconciliation remains the fallback for cases this
+# deterministic check can't see (baselined findings, manual fixes).
+#
+# Reusable workflow: consumers keep the event triggers (and the
+# workflow_dispatch "issue" input) in a small stub and call this with
+# `uses:` — see examples/consumer-stubs/audit-close.yml. The `github` context
+# (event_name, event.pull_request, ...) is the one from the run that
+# ultimately triggered the stub, so it flows through to this workflow
+# unchanged; the stub forwards its own workflow_dispatch "issue" input
+# straight through via `with:`.
+name: audit-close
+
+on:
+  workflow_call:
+    inputs:
+      issue:
+        description: 'Audit issue number to re-reconcile manually'
+        required: false
+        type: string
+
+jobs:
+  reconcile:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.merged == true &&
+      startsWith(github.event.pull_request.head.ref, 'audit-fix/'))
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: read
+      contents: read
+    steps:
+      - name: Close the audit issue if every finding is approved and merged
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          DISPATCH_ISSUE: ${{ inputs.issue }}
+        run: |
+          set -euo pipefail
+
+          # Fix-PR bodies can arrive with HTML-escaped quotes (&#39;, &#34;)
+          # when the authoring session read the finding through a tool that
+          # entity-escapes its output (observed with the GitHub MCP server in
+          # cloud routines: an apostrophe in a finding's title came back as
+          # &#39;, which the verbatim grep below could never match against
+          # the clean issue body, leaving a fully-resolved issue open).
+          # Normalize the common entities on BOTH sides of the comparison.
+          # &amp; decodes last so double-escaped text is not decoded twice.
+          decode_entities() {
+            sed -e "s/&#39;/'/g" -e "s/&#x27;/'/g" -e "s/&apos;/'/g" \
+                -e 's/&#34;/"/g' -e 's/&quot;/"/g' \
+                -e 's/&lt;/</g' -e 's/&gt;/>/g' -e 's/&amp;/\&/g'
+          }
+
+          # The merged PR names its audit issue as "Audit finding from #N";
+          # a manual dispatch names the issue directly.
+          if [ -n "${DISPATCH_ISSUE:-}" ]; then
+            N="$DISPATCH_ISSUE"
+          else
+            N=$(printf '%s' "$PR_BODY" | grep -oE 'Audit finding from #[0-9]+' \
+                  | head -1 | grep -oE '[0-9]+' || true)
+          fi
+          if [ -z "$N" ]; then
+            echo "No audit-issue reference in PR body; nothing to reconcile."
+            exit 0
+          fi
+
+          STATE=$(gh issue view "$N" -R "$REPO" --json state --jq .state)
+          if [ "$STATE" != "OPEN" ]; then
+            echo "Issue #$N already closed."
+            exit 0
+          fi
+          BODY=$(gh issue view "$N" -R "$REPO" --json body --jq .body | decode_entities)
+
+          # Gate 1: every finding checkbox must be checked (undecided blocks).
+          if printf '%s' "$BODY" | grep -qE '^- \[ \]'; then
+            echo "Issue #$N still has undecided findings; leaving open."
+            exit 0
+          fi
+
+          # Gate 2: every checked finding must have a MERGED fix PR quoting
+          # its title verbatim (fix PRs quote findings verbatim by contract).
+          # Build the merged-PR corpus from the non-search PR list — NOT the
+          # search API — matching the same "Audit finding from #<N>" body marker
+          # every fix PR carries (a grouped cross-issue PR references more than
+          # one issue, so a body match still catches it; a head-branch prefix
+          # would not). The search index lags fresh merges by seconds-to-minutes,
+          # so a burst of sibling fix PRs merged moments earlier is missing from
+          # a search-built corpus, wrongly leaving a fully-resolved issue open
+          # (observed both with many PRs merged at once, and with just the
+          # triggering PR alone). `gh pr list` without --search reads live
+          # state, no index — every already-merged sibling is visible at once.
+          # --limit is generous because only recent merges are relevant (an
+          # issue closes within days of its fix PRs merging). The triggering
+          # PR's body is still appended directly as belt-and-suspenders (and it
+          # carries the manual-dispatch case, where PR_BODY is empty and harmless).
+          MERGED=$(gh pr list -R "$REPO" --state merged --limit 500 \
+            --json body \
+            --jq "[.[] | select(.body | contains(\"Audit finding from #$N\")) | .body] | join(\"\n===\n\")")
+          MERGED="${MERGED}
+          ===
+          ${PR_BODY:-}"
+          MERGED=$(printf '%s' "$MERGED" | decode_entities)
+          while IFS= read -r line; do
+            TITLE=$(printf '%s' "$line" | sed -E 's/^- \[[xX]\] \*\*\[[a-z]+\]\*\* //')
+            if ! printf '%s' "$MERGED" | grep -qF "$TITLE"; then
+              echo "Finding without a merged fix PR yet: $TITLE"
+              exit 0
+            fi
+          done < <(printf '%s' "$BODY" | grep -E '^- \[[xX]\]')
+
+          gh issue close "$N" -R "$REPO" --comment \
+            "All approved findings here have merged fix PRs — closing automatically (both human gates passed per finding: checkbox approval + PR review/merge). Reopen if this was premature; the next /audit run's reconciliation remains as fallback."
+          echo "Closed issue #$N."

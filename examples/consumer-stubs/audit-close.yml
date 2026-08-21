@@ -1,0 +1,37 @@
+# Consumer stub for the audit-loop plugin's reusable audit-close workflow.
+# Copy this file into your repo's .github/workflows/ (rename freely),
+# replacing HUB_SLUG below with the hub's owner/repo — /audit-install does
+# this substitution for you.
+name: audit-close
+
+on:
+  pull_request:
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: 'Audit issue number to re-reconcile manually'
+        required: true
+
+jobs:
+  reconcile:
+    # Branch gate at the stub level (cost guard): a closed PR only reaches the
+    # reusable close workflow when it is a fix PR (head branch `audit-fix/**`);
+    # on every other closed PR this job is skipped and bills ZERO minutes, so
+    # the stub never even dispatches the reusable workflow for unrelated PRs.
+    # The workflow_dispatch arm stays so a manual re-reconcile still runs
+    # (its head_ref is empty). The reusable workflow re-checks the same branch
+    # (and merged==true) internally — this is defense in depth, not a change
+    # to which issues close.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.head_ref, 'audit-fix/')
+    # /audit-install substitutes the real hub slug here at install time.
+    uses: HUB_SLUG/.github/workflows/audit-close.yml@main
+    with:
+      issue: ${{ inputs.issue }}
+    secrets: inherit
+    permissions:
+      issues: write
+      pull-requests: read
+      contents: read

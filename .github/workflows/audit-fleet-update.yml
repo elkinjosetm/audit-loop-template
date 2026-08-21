@@ -1,0 +1,142 @@
+# Fleet update — re-vendors the plugin's runtime files into every consumer
+# repo (consumers.txt) and opens one update PR per repo that is behind.
+#
+# This replaces the manual "re-run /audit-install in each repo after a plugin
+# update" chore: push a change to the vendored sources on main and every
+# consumer gets a PR with the refreshed copies. Merging stays manual — the PR
+# is the human gate, exactly like a fix PR.
+#
+# The vendoring rules replicate /audit-install byte for byte (same marker
+# line, same hash, same drift protection): a vendored file whose body no
+# longer matches its own marker hash (hand-edited) or that has no marker is
+# NEVER overwritten — it is listed in the PR body for the owner to reconcile.
+#
+# Credentials: the "audit-loop hub" GitHub App (Contents RW, Pull requests
+# RW), installed on the owner's account. Each run mints an ephemeral (~1h)
+# installation token via vars.AUDIT_APP_ID + secrets.AUDIT_APP_PRIVATE_KEY —
+# no long-lived token with repo write access is ever stored. Update PRs are
+# authored by the App's bot identity, so they still trigger the consumer's
+# own workflows (unlike GITHUB_TOKEN-created PRs).
+name: audit-fleet-update
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'agents/arch-auditor.md'
+      - 'commands/audit.md'
+      - 'commands/audit-fix.md'
+  workflow_dispatch: # re-run for all consumers (e.g. after adding one)
+
+concurrency:
+  group: audit-fleet-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    # Skips cleanly until the App variable/secrets are configured; a skipped job shows neutral, not failed.
+    if: ${{ vars.AUDIT_APP_ID != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: hub
+
+      - name: Mint an ephemeral App installation token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.AUDIT_APP_ID }}
+          private-key: ${{ secrets.AUDIT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }} # all repos of the installation
+
+      - name: Vendor into each consumer and open update PRs
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          HUB="$PWD/hub"
+          SHORT_SHA="$(git -C "$HUB" rev-parse --short=12 HEAD)"
+          BRANCH="audit-loop-update/${SHORT_SHA}"
+
+          # src (relative to hub) -> dst (relative to consumer)
+          FILES=(
+            "agents/arch-auditor.md:.claude/agents/arch-auditor.md"
+            "commands/audit.md:.claude/commands/audit.md"
+            "commands/audit-fix.md:.claude/commands/audit-fix.md"
+          )
+
+          while IFS= read -r repo; do
+            repo="${repo%%#*}"; repo="$(echo "$repo" | xargs)"
+            [ -z "$repo" ] && continue
+            echo "::group::${repo}"
+
+            if gh pr list --repo "$repo" --head "$BRANCH" --state open --json number --jq length | grep -qv '^0$'; then
+              echo "Open update PR for ${BRANCH} already exists — skipping."
+              echo "::endgroup::"
+              continue
+            fi
+
+            dir="$(mktemp -d)"
+            git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${repo}.git" "$dir"
+
+            updated=() skipped=()
+            for entry in "${FILES[@]}"; do
+              src="$HUB/${entry%%:*}"; dst="$dir/${entry#*:}"
+              hash="$(shasum -a 256 "$src" | cut -c1-12)"
+              marker="<!-- audit-loop:vendored sha256:${hash} hub=${GITHUB_REPOSITORY} — managed by /audit-install; do not edit by hand -->"
+
+              write_vendored() {
+                mkdir -p "$(dirname "$dst")"
+                cat "$src" > "$dst"
+                printf '%s\n' "$marker" >> "$dst"
+              }
+
+              if [ ! -f "$dst" ]; then
+                write_vendored; updated+=("${entry#*:} (new)")
+                continue
+              fi
+              last="$(tail -n 1 "$dst")"
+              if [[ "$last" != "<!-- audit-loop:vendored sha256:"* ]]; then
+                skipped+=("${entry#*:} — no vendoring marker (unmanaged copy)")
+                continue
+              fi
+              old_hash="$(sed -E 's/.*sha256:([0-9a-f]{12}).*/\1/' <<<"$last")"
+              body_hash="$(sed '$d' "$dst" | shasum -a 256 | cut -c1-12)"
+              if [ "$body_hash" != "$old_hash" ]; then
+                skipped+=("${entry#*:} — local edits (body no longer matches marker ${old_hash})")
+                continue
+              fi
+              if [ "$old_hash" = "$hash" ]; then
+                echo "${entry#*:} already current (${hash})"
+                continue
+              fi
+              write_vendored; updated+=("${entry#*:} (${old_hash} → ${hash})")
+            done
+
+            if [ "${#updated[@]}" -eq 0 ]; then
+              echo "Nothing to update."
+              [ "${#skipped[@]}" -gt 0 ] && printf 'Drift (not touched): %s\n' "${skipped[@]}"
+              echo "::endgroup::"
+              continue
+            fi
+
+            git -C "$dir" config user.name "github-actions[bot]"
+            git -C "$dir" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git -C "$dir" checkout -b "$BRANCH"
+            git -C "$dir" add .claude/
+            git -C "$dir" commit -m "Update vendored audit-loop files to ${SHORT_SHA}"
+            git -C "$dir" push origin "$BRANCH"
+
+            body="Automated fleet update from [\`${GITHUB_REPOSITORY}@${SHORT_SHA}\`](https://github.com/${GITHUB_REPOSITORY}/commit/${SHORT_SHA})."
+            body+=$'\n\n**Updated:**\n'
+            for u in "${updated[@]}"; do body+="- \`${u}\`"$'\n'; done
+            if [ "${#skipped[@]}" -gt 0 ]; then
+              body+=$'\n**Not touched (local drift — reconcile by hand or delete and re-run /audit-install):**\n'
+              for s in "${skipped[@]}"; do body+="- \`${s}\`"$'\n'; done
+            fi
+            gh pr create --repo "$repo" --head "$BRANCH" \
+              --title "Update vendored audit-loop files to ${SHORT_SHA}" \
+              --body "$body"
+            echo "::endgroup::"
+          done < "$HUB/consumers.txt"

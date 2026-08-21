@@ -1,0 +1,8 @@
+# Consumer repos of the audit loop — one owner/repo per line, comments start with #.
+# Read by the hub workflows in this repo:
+#   - .github/workflows/audit-digest.yml       (daily notification digest)
+#   - .github/workflows/audit-file.yml         (filing relay: validates fleet membership)
+#   - .github/workflows/audit-fleet-update.yml (re-vendors plugin files via PR)
+# /audit-install registers new consumers here automatically; removing a line
+# stops digest coverage and fleet updates for that repo (its vendored files
+# keep working, they just stop receiving updates).

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "audit-loop",
+  "description": "Centralized architecture-audit loop for Claude Code: arch-auditor agent, /audit, /audit-fix, /audit-install.",
+  "owner": {
+    "name": "Elkin Torres",
+    "url": "https://github.com/elkinjosetm"
+  },
+  "plugins": [
+    {
+      "name": "audit-loop",
+      "description": "Architecture audit loop: derive standards from the repo's own docs, file findings as issues, sweep approved findings into fix PRs.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}

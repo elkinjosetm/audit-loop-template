@@ -1,0 +1,188 @@
+# Hub relay — files audit issues and fix PRs in consumer repos as the App.
+#
+# Why central: consumer sessions (including unattended cloud routines) run with
+# the owner's own gh auth, which is enough to READ and to push branches, but we
+# do NOT want them creating issues/PRs directly — self-authored items fire no
+# notifications, filing is racy, and every consumer would need write scope. So
+# sessions never run `gh issue create` / `gh pr create`; instead they trigger
+# THIS workflow (workflow_dispatch), and it files the item in the target
+# consumer as the App. Filing is create-only: no run ever edits an existing
+# audit issue's body, checkboxes, or order.
+#
+# Why workflow_dispatch (not repository_dispatch): cloud routine environments
+# have no gh CLI and reach GitHub only through a GitHub MCP server whose
+# Actions surface can run existing workflows but cannot send a
+# repository_dispatch or raw REST calls (verified live 2026-07-03). Triggering
+# a workflow is the one relay transport every session type can use — gh
+# environments via `gh workflow run`, MCP environments via their workflow-run
+# tool. It requires the hub repo to be in the session's GitHub scope (routines
+# list the hub as a second source — see docs/runbook.md).
+#
+# One dispatch = one filed item. `kind` input picks what to file (see the
+# /audit and /audit-fix commands for the sender side):
+#   - issue : one new audit issue in the target consumer
+#   - pr    : one fix PR in the target consumer (branch already pushed)
+#
+# SECURITY: the inputs are UNTRUSTED text. They are NEVER interpolated into
+# a `run:` shell via ${{ }}; all input handling goes through
+# actions/github-script (parsed object, no shell) and the body travels via a
+# file (/tmp/body.md). The target repo is validated against consumers.txt
+# (registration is the membership) before anything is filed, and the App token
+# is minted scoped to that single repo and to the minimum permissions.
+#
+# Credentials (this repo only — consumers hold none). Repo access comes from
+# the "audit-loop hub" GitHub App installed on the owner's account: the stored
+# private key can only mint installation tokens; the token that actually touches
+# repos is generated per run, scoped to the one target repo, and expires in
+# ~1 hour. Nothing long-lived with repo access is ever stored.
+#   vars.AUDIT_APP_ID              the GitHub App's numeric ID
+#   secrets.AUDIT_APP_PRIVATE_KEY  the App's private key (PEM)
+# The App's Issues and Pull requests permissions must both be read+write.
+name: audit-file
+
+on:
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: 'What to file'
+        required: true
+        type: choice
+        options: [issue, pr]
+      target_repo:
+        description: 'Consumer to file into (owner/repo, must be in consumers.txt)'
+        required: true
+        type: string
+      marker:
+        description: 'Run marker (lowercase UUID) for sender poll-back'
+        required: true
+        type: string
+      title:
+        description: 'Issue/PR title'
+        required: true
+        type: string
+      body:
+        description: 'Issue/PR body (markdown)'
+        required: true
+        type: string
+      head:
+        description: 'PR head branch (audit-fix/*, kind=pr only)'
+        required: false
+        type: string
+        default: ''
+      base:
+        description: 'PR base branch (kind=pr only)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read # checkout consumers.txt only; the App token does the filing
+
+jobs:
+  file:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4 # for consumers.txt
+
+      - name: Validate payload and fleet membership
+        id: validate
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const p = context.payload.inputs || {};
+            const kind = String(p.kind || ''); // 'issue' | 'pr'
+            if (kind !== 'issue' && kind !== 'pr') { core.setFailed('bad kind'); process.exit(1); }
+            const fail = (m) => { core.setFailed(m); process.exit(1); };
+
+            const repo = String(p.target_repo || '');
+            if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) fail('bad target_repo');
+            const [owner] = repo.split('/');
+            if (owner.toLowerCase() !== context.repo.owner.toLowerCase())
+              fail('target owner is not the hub owner');
+
+            // Registration is the membership: reject non-consumers. Normalize
+            // each line (strip comments + whitespace) and compare case-insensitively,
+            // since GitHub owner/repo names are case-insensitive.
+            const fleet = fs.readFileSync('consumers.txt', 'utf8').split('\n')
+              .map(l => l.split('#')[0].trim()).filter(Boolean);
+            const match = fleet.find(f => f.toLowerCase() === repo.toLowerCase());
+            if (!match) fail(`${repo} is not in consumers.txt — refusing to file`);
+
+            const marker = String(p.marker || '');
+            if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(marker))
+              fail('bad run marker');
+            const title = String(p.title || '');
+            if (!title || title.length > 256 || /\n/.test(title)) fail('bad title');
+            const body = String(p.body || '');
+            // 65,000: stays inside GitHub's 65,536-char issue-body cap with
+            // headroom for the appended marker line (workflow_dispatch itself
+            // caps the combined inputs at 65,535 chars, so an oversized body
+            // is rejected before this run even starts — this check is the
+            // in-run backstop).
+            if (!body || Buffer.byteLength(body, 'utf8') > 65000) fail('bad body size');
+
+            if (kind === 'pr') {
+              const head = String(p.head || '');
+              if (!/^audit-fix\/[A-Za-z0-9._/-]+$/.test(head) || head.includes('..'))
+                fail('bad head: must be audit-fix/* with safe charset');
+              const base = String(p.base || '');
+              if (!/^[A-Za-z0-9._/-]+$/.test(base) || base.includes('..')) fail('bad base');
+            }
+
+            // Marker travels to the created item as an HTML comment, so the
+            // sending session can poll for the item and report its URL.
+            fs.writeFileSync('/tmp/body.md',
+              body + `\n\n<!-- audit-loop:run ${marker} -->\n`);
+            core.setOutput('kind', kind);
+            // Canonical owner/repo from consumers.txt (validated against the
+            // fleet list) — every later step files against THIS, never the raw
+            // payload value, so token scope and filing target can't diverge
+            // on letter-casing.
+            core.setOutput('repo_full', match);
+            core.setOutput('repo_name', match.split('/')[1]);
+
+      - name: Mint an ephemeral App installation token (repo- and permission-scoped)
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.AUDIT_APP_ID }}
+          private-key: ${{ secrets.AUDIT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ steps.validate.outputs.repo_name }} # single-repo token
+          permission-issues: write
+          permission-pull-requests: write
+          permission-contents: read
+
+      - name: File the issue or PR in the target consumer
+        uses: actions/github-script@v7
+        env:
+          # Canonical consumers.txt entry from the validate step — regex- and
+          # fleet-validated, so it is safe to consume and cannot disagree in
+          # casing with the repo the App token above was scoped to.
+          TARGET_REPO: ${{ steps.validate.outputs.repo_full }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const fs = require('fs');
+            const p = context.payload.inputs;
+            const [owner, repo] = process.env.TARGET_REPO.split('/');
+            const body = fs.readFileSync('/tmp/body.md', 'utf8');
+
+            if (p.kind === 'issue') {
+              // Ensure the audit label exists (idempotent). Color/description
+              // must match audit-install.md step 4 exactly.
+              try {
+                await github.rest.issues.getLabel({ owner, repo, name: 'audit' });
+              } catch {
+                await github.rest.issues.createLabel({ owner, repo, name: 'audit',
+                  color: '5319E7', description: 'Findings filed by the /audit command' });
+              }
+              const { data } = await github.rest.issues.create({
+                owner, repo, title: p.title, body, labels: ['audit'] });
+              core.notice(`Filed issue ${data.html_url}`);
+            } else {
+              const { data } = await github.rest.pulls.create({
+                owner, repo, title: p.title, body, head: p.head, base: p.base });
+              core.notice(`Filed PR ${data.html_url}`);
+            }

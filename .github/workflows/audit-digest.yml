@@ -1,0 +1,269 @@
+# Audit digest — the hub side of the audit-loop notification model.
+#
+# Why central: notifications used to be a per-consumer Pushover workflow, which
+# meant two secrets per repo, generic copy, and up to one push per event — at a
+# daily audit cadence across several projects that stops being signal. This
+# workflow replaces all of that: it is ON-DEMAND (workflow_dispatch only, in
+# THIS repo only) — each /audit and /audit-fix session triggers one sweep as
+# its final step, after everything it filed through the relay has landed, so
+# a sweep can never run mid-filing and news is announced minutes after it
+# exists instead of waiting for a cron that must be kept phase-locked with
+# the routines' hours. Every sweep still covers the WHOLE fleet (an ephemeral
+# GitHub App installation token over consumers.txt), so news orphaned by a
+# session that died before dispatching is picked up by the next session's
+# sweep, whichever repo it audited.
+#
+# Notifications are scoped per consumer: one Pushover push PER REPO WITH
+# NEWS, titled with that repo's name, so each push reads as "this project
+# has something for you". Every issue/PR number in the message is an HTML
+# link to the item (Pushover html=1). Delivery itself is channel-selectable
+# per hub instance (vars.DIGEST_CHANNEL — Pushover here, Slack in a fork that
+# notifies a workspace), while the digest semantics are invariant: at most one
+# scoped notification per consumer with news, only when there is news, every
+# referenced issue/PR linked in that channel's own link markup. The delivery
+# channel is chosen by a repo variable, so one hub instance can notify
+# Pushover and another Slack from the same workflow file; an unknown value
+# fails the run rather than silently swallowing the notifications.
+#
+# What counts as news (delta against state/audit-digest.json, committed back
+# to main after every run):
+#   - unchecked findings appeared in a repo's open audit issues (a new audit
+#     issue filed by an /audit run)
+#   - an audit-fix/** PR was opened since the last run
+# Checking a box, merging a PR, or closing an issue reduces the pending counts
+# but never triggers a push — the digest only speaks when there is something
+# NEW to triage or review. Nothing new anywhere → no push at all. A manual
+# run with force_push=true pushes even without news — that is the secrets
+# test (routine-triggered dispatches leave it false).
+#
+# Credentials (this repo only — consumers hold none). Repo access comes from
+# the "audit-loop hub" GitHub App installed on the owner's account (all
+# repositories): the stored private key can only mint installation tokens;
+# the token that actually touches repos is generated per run and expires in
+# ~1 hour. Nothing long-lived with repo access is ever stored.
+#   vars.AUDIT_APP_ID                the GitHub App's numeric ID
+#   secrets.AUDIT_APP_PRIVATE_KEY    the App's private key (PEM)
+#   vars.DIGEST_CHANNEL              delivery channel: unset/empty or
+#                                    "pushover" (the default) | "slack"
+#   secrets.AUDIT_PUSHOVER_TOKEN     dedicated Pushover application token
+#                                    (pushover channel only)
+#   secrets.AUDIT_PUSHOVER_USER      Pushover user key (pushover channel only)
+#   secrets.AUDIT_SLACK_WEBHOOK_URL  Slack incoming webhook URL (slack channel
+#                                    only)
+name: audit-digest
+
+on:
+  # On-demand only — no crons. Sessions dispatch a sweep as their final step
+  # (see the vendored /audit and /audit-fix commands); concurrency below
+  # queues overlapping dispatches so snapshot commits never race.
+  workflow_dispatch:
+    inputs:
+      force_push:
+        description: 'Push even with no news (secrets test / manual check)'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write # to commit the state snapshot back to main
+
+concurrency:
+  group: audit-digest
+  cancel-in-progress: false
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fail fast on a mistyped channel: an unknown value would otherwise match
+      # no send step and the sweep would finish "green" with nobody notified.
+      - name: Validate the digest channel
+        env:
+          DIGEST_CHANNEL: ${{ vars.DIGEST_CHANNEL }}
+        run: |
+          set -euo pipefail
+          case "${DIGEST_CHANNEL:-}" in
+            ''|pushover|slack)
+              echo "Digest channel: ${DIGEST_CHANNEL:-pushover (default)}"
+              ;;
+            *)
+              echo "Unknown DIGEST_CHANNEL '${DIGEST_CHANNEL}'." >&2
+              echo "Allowed values: unset/empty or 'pushover' (default), or 'slack'." >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Mint an ephemeral App installation token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.AUDIT_APP_ID }}
+          private-key: ${{ secrets.AUDIT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }} # all repos of the installation
+
+      - name: Fetch open audit issues and fix PRs per consumer
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digest
+          : > /tmp/digest/repos.txt
+          while IFS= read -r repo; do
+            repo="${repo%%#*}"; repo="$(echo "$repo" | xargs)"
+            [ -z "$repo" ] && continue
+            slug="${repo//\//__}"
+            # issues endpoint returns PRs too — the compute step filters them out
+            gh api "repos/${repo}/issues?labels=audit&state=open&per_page=100" \
+              > "/tmp/digest/${slug}.issues.json" || echo '[]' > "/tmp/digest/${slug}.issues.json"
+            gh api "repos/${repo}/pulls?state=open&per_page=100" \
+              > "/tmp/digest/${slug}.prs.json" || echo '[]' > "/tmp/digest/${slug}.prs.json"
+            echo "$repo" >> /tmp/digest/repos.txt
+          done < consumers.txt
+
+      - name: Compute deltas and build the digest message
+        id: compute
+        run: |
+          python3 - <<'PY'
+          import json, os, re, pathlib
+
+          state_path = pathlib.Path("state/audit-digest.json")
+          prev = json.loads(state_path.read_text()) if state_path.exists() else {}
+
+          repos_path = pathlib.Path("/tmp/digest/repos.txt")
+          repos = repos_path.read_text().split() if repos_path.exists() else []
+          lines, state = [], {}
+
+          for repo in repos:
+              slug = repo.replace("/", "__")
+              raw = json.loads(pathlib.Path(f"/tmp/digest/{slug}.issues.json").read_text())
+              issues = [i for i in raw if "pull_request" not in i]
+              prs_raw = json.loads(pathlib.Path(f"/tmp/digest/{slug}.prs.json").read_text())
+              prs = [p for p in prs_raw if p["head"]["ref"].startswith("audit-fix/")]
+
+              cur_issues = {
+                  str(i["number"]): len(re.findall(r"^\s*- \[ \]", i["body"] or "", re.M))
+                  for i in issues
+              }
+              cur_prs = sorted(p["number"] for p in prs)
+              state[repo] = {"issues": cur_issues, "prs": cur_prs}
+
+              prev_repo = prev.get(repo, {"issues": {}, "prs": []})
+              new_findings = sum(
+                  max(0, n - prev_repo["issues"].get(num, 0))
+                  for num, n in cur_issues.items()
+              )
+              new_prs = [n for n in cur_prs if n not in prev_repo["prs"]]
+
+              if not new_findings and not new_prs:
+                  continue
+
+              name = repo.split("/")[1]
+              pending = sum(cur_issues.values())
+              base = f"https://github.com/{repo}"
+
+              def issue_link(n):
+                  return f'<a href="{base}/issues/{n}">#{n}</a>'
+
+              def pr_link(n):
+                  return f'<a href="{base}/pull/{n}">#{n}</a>'
+
+              parts = []
+              if new_findings:
+                  refs = " ".join(issue_link(n) for n in sorted(cur_issues, key=int))
+                  parts.append(f"{new_findings} hallazgo{'s' if new_findings != 1 else ''} nuevo{'s' if new_findings != 1 else ''} ({refs} — {pending} sin triage)")
+              if new_prs:
+                  refs = " ".join(pr_link(n) for n in new_prs)
+                  parts.append(f"{len(new_prs)} fix PR{'s' if len(new_prs) != 1 else ''} nuevo{'s' if len(new_prs) != 1 else ''} ({refs})")
+              if cur_prs and not new_prs:
+                  refs = " ".join(pr_link(n) for n in cur_prs)
+                  parts.append(f"{len(cur_prs)} PR{'s' if len(cur_prs) != 1 else ''} esperando review ({refs})")
+              # One entry per repo with news → one scoped push each.
+              lines.append({"name": name, "message": " · ".join(parts)})
+
+          state_path.parent.mkdir(exist_ok=True)
+          state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+          pathlib.Path("/tmp/digest/news.json").write_text(json.dumps(lines))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"has_news={'true' if lines else 'false'}\n")
+          for entry in lines:
+              print(f"{entry['name']}: {entry['message']}")
+          if not lines:
+              print("Sin novedades en ningún proyecto.")
+          PY
+
+      # One push per repo with news, titled with the repo's name — each push
+      # is scoped to one project. force_push=true with no news sends a single
+      # "sin novedades" push instead (the secrets test).
+      - name: Send Pushover digest
+        if: (steps.compute.outputs.has_news == 'true' || inputs.force_push) && (vars.DIGEST_CHANNEL == '' || vars.DIGEST_CHANNEL == 'pushover')
+        env:
+          PUSHOVER_TOKEN: ${{ secrets.AUDIT_PUSHOVER_TOKEN }}
+          PUSHOVER_USER: ${{ secrets.AUDIT_PUSHOVER_USER }}
+        run: |
+          set -euo pipefail
+          push() { # $1 = title, $2 = message
+            curl -sf --form-string "token=${PUSHOVER_TOKEN}" \
+              --form-string "user=${PUSHOVER_USER}" \
+              --form-string "title=$1" \
+              --form-string "message=$2" \
+              --form-string "html=1" \
+              --form-string "priority=0" \
+              https://api.pushover.net/1/messages.json > /dev/null
+          }
+          count=$(python3 -c "import json;print(len(json.load(open('/tmp/digest/news.json'))))")
+          if [ "$count" -eq 0 ]; then
+            push "Auditoría" "Sin novedades en ningún proyecto."
+            exit 0
+          fi
+          for i in $(seq 0 $((count - 1))); do
+            name=$(python3 -c "import json;print(json.load(open('/tmp/digest/news.json'))[$i]['name'])")
+            msg=$(python3 -c "import json;print(json.load(open('/tmp/digest/news.json'))[$i]['message'])")
+            push "Auditoría — ${name}" "$msg"
+          done
+
+      # Same sweep, same per-repo scoping, same copy — only the transport
+      # differs. The compute step emits Pushover-flavoured HTML links; since
+      # that markup is machine-generated and uniform, rewriting exactly
+      # <a href="URL">TEXT</a> into Slack's <URL|TEXT> at send time is enough.
+      # Escaping invariant: digest messages must never contain a bare &, <,
+      # or > outside the generated links — Slack would silently render the
+      # corrupted markup (HTTP 200, undetectable by curl). Anyone changing
+      # the compute step's message text must preserve that property or add
+      # escaping here.
+      - name: Send Slack digest
+        if: (steps.compute.outputs.has_news == 'true' || inputs.force_push) && vars.DIGEST_CHANNEL == 'slack'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.AUDIT_SLACK_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+          push() { # $1 = title, $2 = message
+            python3 -c 'import json,sys;print(json.dumps({"text": "*" + sys.argv[1] + "*\n" + sys.argv[2]}))' "$1" "$2" \
+              | curl -sS --fail-with-body -H 'Content-type: application/json' --data @- \
+                "${SLACK_WEBHOOK_URL}" > /dev/null
+          }
+          count=$(python3 -c "import json;print(len(json.load(open('/tmp/digest/news.json'))))")
+          if [ "$count" -eq 0 ]; then
+            push "Auditoría" "Sin novedades en ningún proyecto."
+            exit 0
+          fi
+          for i in $(seq 0 $((count - 1))); do
+            name=$(python3 -c "import json;print(json.load(open('/tmp/digest/news.json'))[$i]['name'])")
+            msg=$(python3 -c "import json,re;m=json.load(open('/tmp/digest/news.json'))[$i]['message'];print(re.sub(r'<a href=\"([^\"]*)\">(.*?)</a>', r'<\1|\2>', m))")
+            push "Auditoría — ${name}" "$msg"
+          done
+
+      - name: Commit the state snapshot
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- state/audit-digest.json && [ -z "$(git status --porcelain state/)" ]; then
+            echo "State unchanged — nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/audit-digest.json
+          git commit -m "audit-digest: update state snapshot"
+          git push

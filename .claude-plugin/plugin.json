@@ -1,0 +1,8 @@
+{
+  "name": "audit-loop",
+  "description": "Architecture audit loop: derive standards from the repo's own docs, file findings as issues, sweep approved findings into fix PRs.",
+  "author": {
+    "name": "Elkin Torres",
+    "url": "https://github.com/elkinjosetm"
+  }
+}
