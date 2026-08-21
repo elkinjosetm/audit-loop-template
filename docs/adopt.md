@@ -100,9 +100,21 @@ All credentials in the system live on the hub; consumers hold none (see
    Restrict install to **only this account**.
 3. Note the **App ID**, then **Generate a private key** — this downloads a
    `.pem` file.
-4. **Install the App** on your account with **All repositories** — every
-   current and future consumer is covered automatically, so adding a
-   project later never means touching credentials again.
+4. **Install the App** on your account, choosing one of two scopes:
+   - **Only select repositories** — least privilege: the App's
+     read/write permissions reach only the repos you pick. Cost: every
+     new consumer means returning to the App installation to add it (a
+     manual step `/audit-install` cannot do for you) — forget it and
+     the relay's filings for that repo fail.
+   - **All repositories** — convenience: every current and future
+     consumer is covered automatically; adding a project never touches
+     credentials again. Cost: the App's permissions span the whole
+     account, so treat this as an explicit least-privilege exception
+     you accept knowingly.
+
+   Either way, `consumers.txt` limits which repos the relay will file
+   into, but it does not narrow the installation token's repository
+   scope — that is set only by the install choice above.
 5. Wire the hub:
 
    ```bash
