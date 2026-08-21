@@ -237,7 +237,14 @@ makes:
 | Routine | Cadence (reference) | Prompt |
 |---|---|---|
 | `<repo> daily audit` | daily, early morning | `Run /audit and let it record the findings.` |
-| `<repo> daily audit-fix` (optional, once you trust the loop) | daily, late afternoon | `Run /audit-fix and open PRs for the approved findings.` |
+| `<repo> daily audit-fix` | daily, late afternoon | `Run /audit-fix and open PRs for the approved findings.` |
+
+Both routines are the reference setup. The fix routine only ever
+implements findings you've already checked, and is a silent no-op
+otherwise — there is no trust ramp to wait through before scheduling
+it. If you'd rather not schedule it, you can run `/audit-fix` by hand
+from a local session instead; the loop works either way, the routine
+just removes the chore.
 
 Required for both: **the hub fork (`<hub-slug>`) as a second source repo.**
 Cloud routine sessions reach GitHub only through a GitHub MCP server scoped
