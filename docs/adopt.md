@@ -286,7 +286,12 @@ human-owned gates — nothing else in the loop asks you for anything:
    directly.
 4. **Review gate:** review each PR like any other and merge the ones you
    want. Once every finding in an issue is checked and has a merged fix PR
-   quoting it, `audit-close.yml` closes the issue on its own.
+   quoting it, `audit-close.yml` closes the issue on its own. Findings you
+   resolve by baselining or by fixing manually don't trigger that
+   auto-close — the next `/audit` run's closability check reconciles them
+   too, and once every finding in the issue is merged or baselined, it
+   leaves a comment saying the issue can be closed. It never closes the
+   issue itself; that stays yours to do.
 5. If a fix PR conflicts or goes stale, **close it unmerged** to
    *regenerate* it — the box stays checked, and the next `/audit-fix` run
    re-implements the finding from current `main`. To **abandon** a finding
